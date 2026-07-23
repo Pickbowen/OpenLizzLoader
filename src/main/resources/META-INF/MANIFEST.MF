@@ -1,7 +1,0 @@
-Manifest-Version: 1.0
-Specification-Title: hey
-Specification-Version: 1
-Implementation-Title: zen
-Implementation-Version: 1.0-SNAPSHOT
-Implementation-Timestamp: 2026-05-17T18:00:32+0800
-
