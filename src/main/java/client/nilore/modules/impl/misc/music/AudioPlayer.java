@@ -7,6 +7,9 @@ import javax.sound.sampled.DataLine;
 import javax.sound.sampled.FloatControl;
 import javax.sound.sampled.SourceDataLine;
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -41,15 +44,50 @@ public class AudioPlayer {
     private volatile long seekDisplayMs = -1;
     private volatile long bytesConsumedFromStream = 0;
 
+    // melodify seamless next-track preloading
+    public static final long PRELOAD_LEAD_MS = 20000;
+    private volatile boolean melodifyEnabled;
+    private volatile Runnable nearEndListener;
+    private volatile boolean nearEndFired;
+    private volatile PreloadedTrack preloaded;
+    private volatile boolean usePreload;
+
+    // crossfade: overlap fade-out/fade-in between current and preloaded next track
+    public static final long CROSSFADE_MS = 12000;
+    private volatile boolean crossfadeActive;
+    private volatile boolean crossfadeTakeover;
+    private volatile SourceDataLine crossfadeLine;
+    private volatile SourceDataLine pendingLine;
+    private volatile long preloadOffsetBytes;
+    private volatile long pendingPreloadOffset;
+    private volatile Runnable crossfadeCallback;
+    private volatile Runnable onCrossfadeTrackListener;
+
     public void play(SongInfo song, String url) {
-        play(song, url, null);
+        play(song, url, null, false);
     }
 
     public void play(SongInfo song, String url, Runnable onNaturalEnd) {
+        play(song, url, onNaturalEnd, false);
+    }
+
+    public void play(SongInfo song, String url, Runnable onNaturalEnd, boolean usePreload) {
+        long offset = usePreload ? pendingPreloadOffset : 0;
+        this.pendingPreloadOffset = 0;
+        playInternalWithState(song, url, onNaturalEnd, usePreload, offset);
+    }
+
+    private void playInternalWithState(SongInfo song, String url, Runnable onNaturalEnd,
+                                       boolean usePreload, long preloadOffset) {
         stop();
         long generation = playbackGeneration.incrementAndGet();
         this.currentSong = song;
         this.currentUrl = url;
+        this.usePreload = usePreload;
+        this.preloadOffsetBytes = preloadOffset;
+        this.nearEndFired = false;
+        this.crossfadeTakeover = false;
+        this.crossfadeCallback = onNaturalEnd;
         this.state.set(State.LOADING);
         this.paused = false;
         this.totalPausedMs = 0;
@@ -87,6 +125,9 @@ public class AudioPlayer {
         paused = false;
         seekTargetMs = -1;
         seekDisplayMs = -1;
+        crossfadeActive = false;
+        crossfadeTakeover = true;
+        crossfadeLine = null;
         currentSong = null;
         currentUrl = null;
         if (currentLine != null) {
@@ -106,6 +147,230 @@ public class AudioPlayer {
             pause();
         } else if (state.get() == State.PAUSED) {
             resume();
+        }
+    }
+
+    // ---- Melodify seamless next-track preloading ----
+
+    public void setMelodifyEnabled(boolean enabled) {
+        this.melodifyEnabled = enabled;
+        if (!enabled) {
+            clearPreload();
+        }
+    }
+
+    public boolean isMelodifyEnabled() {
+        return melodifyEnabled;
+    }
+
+    public void setNearEndListener(Runnable listener) {
+        this.nearEndListener = listener;
+    }
+
+    public void setOnCrossfadeTrackListener(Runnable listener) {
+        this.onCrossfadeTrackListener = listener;
+    }
+
+    public boolean isPreloadedFor(SongInfo song) {
+        PreloadedTrack pre = preloaded;
+        return pre != null && pre.pcm != null && song != null && pre.song.id == song.id;
+    }
+
+    public String getPreloadedUrl(SongInfo song) {
+        PreloadedTrack pre = preloaded;
+        return (pre != null && song != null && pre.song.id == song.id) ? pre.url : null;
+    }
+
+    public void clearPreload() {
+        this.preloaded = null;
+    }
+
+    public void preloadNext(SongInfo song, String url) {
+        if (song == null || url == null || url.isBlank()) return;
+        if (isPreloadedFor(song)) return;
+        clearPreload();
+        long generation = playbackGeneration.get();
+        Thread thread = new Thread(() -> {
+            PreloadedTrack track = null;
+            try {
+                track = decodePreload(song, url, generation);
+            } catch (Exception e) {
+                System.err.println("[MusicPlayer] Preload failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+            if (track != null && generation == playbackGeneration.get()
+                    && state.get() != State.STOPPED && melodifyEnabled) {
+                this.preloaded = track;
+                System.out.println("[MusicPlayer] Preloaded: " + song.name);
+            }
+        }, "MusicPlayer-Preload");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private PreloadedTrack decodePreload(SongInfo song, String url, long generation) throws Exception {
+        MusicHttp.StreamResponse response = MusicHttp.getInputStream(URI.create(url));
+        BufferedInputStream bis = new BufferedInputStream(response.body());
+        AudioInputStream rawStream = AudioSystem.getAudioInputStream(bis);
+        try {
+            AudioFormat baseFormat = rawStream.getFormat();
+            AudioFormat decoded = new AudioFormat(
+                    AudioFormat.Encoding.PCM_SIGNED,
+                    baseFormat.getSampleRate(),
+                    16,
+                    baseFormat.getChannels(),
+                    baseFormat.getChannels() * 2,
+                    baseFormat.getSampleRate(),
+                    false
+            );
+            AudioInputStream ais = AudioSystem.getAudioInputStream(decoded, rawStream);
+            try {
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = ais.read(buf)) != -1) {
+                    if (generation != playbackGeneration.get() || state.get() == State.STOPPED) {
+                        return null;
+                    }
+                    out.write(buf, 0, n);
+                }
+                if (song.duration <= 0) {
+                    long frames = rawStream.getFrameLength();
+                    if (frames > 0) {
+                        song.duration = (long) (frames / baseFormat.getSampleRate() * 1000);
+                    }
+                }
+                return new PreloadedTrack(song, url, decoded, out.toByteArray());
+            } finally {
+                try { ais.close(); } catch (Exception ignored) {}
+            }
+        } finally {
+            try { rawStream.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    // ---- Crossfade between current track and preloaded next ----
+
+    private void startCrossfade(PreloadedTrack track, long generation, long fadeMs) {
+        if (track == null || track.pcm == null || track.pcm.length == 0) return;
+        crossfadeActive = true;
+        Thread thread = new Thread(() -> runCrossfade(track, generation, fadeMs), "MusicPlayer-Crossfade");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void runCrossfade(PreloadedTrack track, long generation, long fadeMs) {
+        SourceDataLine bLine = null;
+        long consumed = 0;
+        boolean fadeCompleted = false;
+        try {
+            bLine = (SourceDataLine) AudioSystem.getLine(new DataLine.Info(SourceDataLine.class, track.format));
+            bLine.open(track.format);
+            crossfadeLine = bLine;
+            bLine.start();
+            ByteArrayInputStream in = new ByteArrayInputStream(track.pcm);
+            byte[] buf = new byte[4096];
+            int channels = track.format.getChannels();
+            long start = System.currentTimeMillis();
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                if (generation != playbackGeneration.get() || state.get() == State.STOPPED
+                        || crossfadeLine != bLine) {
+                    break;
+                }
+                long elapsed = System.currentTimeMillis() - start;
+                float t = Math.max(0f, Math.min(1f, (float) elapsed / fadeMs));
+                applyDigitalGain(buf, n, volume * t, channels);
+                analyzePcm(buf, n, channels, generation);
+                bLine.write(buf, 0, n);
+                consumed += n;
+                // keep the continue-offset in sync at all times, so a natural
+                // end of the current track (even before the fade completes)
+                // resumes the preload from exactly where we stopped.
+                this.pendingPreloadOffset = consumed;
+                SourceDataLine main = currentLine;
+                if (main != null && main != bLine) {
+                    setLineGain(main, volume * (1f - t));
+                }
+                if (t >= 1f) {
+                    fadeCompleted = true;
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[MusicPlayer] Crossfade failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        } finally {
+            crossfadeLine = null;
+            crossfadeActive = false;
+            // If the fade finished first, take over playback of the preloaded
+            // track right here on this thread, reusing bLine. No new thread,
+            // no new SourceDataLine, no gap: the buffered audio keeps flowing.
+            if (fadeCompleted && generation == playbackGeneration.get()
+                    && consumed > 0) {
+                long gen = playbackGeneration.incrementAndGet();
+                this.pendingPreloadOffset = consumed;
+                this.currentSong = track.song;
+                this.currentUrl = track.url;
+                this.usePreload = true;
+                this.preloadOffsetBytes = consumed;
+                this.nearEndFired = false;
+                this.crossfadeTakeover = false;
+                this.paused = false;
+                this.totalPausedMs = 0;
+                this.playStartMs = System.currentTimeMillis();
+                this.seekTargetMs = -1;
+                this.seekDisplayMs = -1;
+                this.playbackThread = Thread.currentThread();
+                this.state.set(State.PLAYING);
+                // hand the crossfade line to the resumed playback
+                this.pendingLine = bLine;
+                bLine = null;
+                // let the UI switch to the new track (queue index / lyrics)
+                Runnable notifier = onCrossfadeTrackListener;
+                if (notifier != null) {
+                    try { notifier.run(); } catch (Exception e) {
+                        System.err.println("[MusicPlayer] Crossfade track switch failed: " + e.getMessage());
+                    }
+                }
+                playInternal(track.url, gen, track.song, crossfadeCallback);
+                return;
+            }
+            if (bLine != null) {
+                // drain the line's buffer before closing so the preloaded audio
+                // already fed to the device keeps playing; otherwise the takeover
+                // drops that tail and the transition stutters.
+                try { bLine.drain(); } catch (Exception ignored) {}
+                try { bLine.stop(); } catch (Exception ignored) {}
+                try { bLine.flush(); } catch (Exception ignored) {}
+                try { bLine.close(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private void setLineGain(SourceDataLine line, float gain) {
+        if (line == null) return;
+        try {
+            if (line.isControlSupported(FloatControl.Type.MASTER_GAIN)) {
+                FloatControl gainControl = (FloatControl) line.getControl(FloatControl.Type.MASTER_GAIN);
+                float g = Math.max(0.0001f, Math.min(1f, gain));
+                float dB = (float) (Math.log(g) / Math.log(10.0) * 20.0);
+                dB = Math.max(gainControl.getMinimum(), Math.min(dB, gainControl.getMaximum()));
+                gainControl.setValue(dB);
+            }
+        } catch (Exception ignored) { }
+    }
+
+    private void applyDigitalGain(byte[] pcm, int length, float gain, int channels) {
+        int frameSize = channels * 2;
+        int frames = length / frameSize;
+        for (int frame = 0; frame < frames; frame++) {
+            int frameOffset = frame * frameSize;
+            for (int channel = 0; channel < channels; channel++) {
+                int offset = frameOffset + channel * 2;
+                short sample = (short) ((pcm[offset] & 0xFF) | (pcm[offset + 1] << 8));
+                short scaled = (short) (sample * gain);
+                pcm[offset] = (byte) (scaled & 0xFF);
+                pcm[offset + 1] = (byte) ((scaled >>> 8) & 0xFF);
+            }
         }
     }
 
@@ -211,53 +476,112 @@ public class AudioPlayer {
         SourceDataLine localLine = null;
         boolean reachedEnd = false;
         boolean naturalEnd = false;
+        boolean usePreload = this.usePreload;
+        this.usePreload = false;
         try {
             System.out.println("[MusicPlayer] Starting playback: " + url);
-            MusicHttp.StreamResponse response = MusicHttp.getInputStream(URI.create(url));
-            BufferedInputStream bis = new BufferedInputStream(response.body());
-            AudioInputStream rawStream = AudioSystem.getAudioInputStream(bis);
-            AudioFormat baseFormat = rawStream.getFormat();
-
-            AudioFormat decoded = new AudioFormat(
-                    AudioFormat.Encoding.PCM_SIGNED,
-                    baseFormat.getSampleRate(),
-                    16,
-                    baseFormat.getChannels(),
-                    baseFormat.getChannels() * 2,
-                    baseFormat.getSampleRate(),
-                    false
-            );
-
-            AudioInputStream ais = AudioSystem.getAudioInputStream(decoded, rawStream);
-
-            // compute duration from audio stream
-            if (currentSong != null) {
-                long frames = rawStream.getFrameLength();
-                if (frames > 0) {
-                    currentSong.duration = (long)(frames / baseFormat.getSampleRate() * 1000);
-                } else {
-                    long contentLength = response.headers().firstValueAsLong("Content-Length").orElse(-1);
-                    if (contentLength > 0) {
-                        int bytesPerSec = (int)(baseFormat.getSampleRate() * baseFormat.getFrameSize());
-                        if (bytesPerSec > 0) {
-                            currentSong.duration = (contentLength * 1000L) / bytesPerSec;
+            AudioInputStream rawStream = null;
+            AudioFormat decoded = null;
+            InputStream pcmSource = null;
+            long preloadSkipMs = 0;
+            if (usePreload) {
+                PreloadedTrack pre = preloaded;
+                if (pre != null && pre.song.id == song.id && pre.pcm != null) {
+                    decoded = pre.format;
+                    ByteArrayInputStream bin = new ByteArrayInputStream(pre.pcm);
+                    long offset = preloadOffsetBytes;
+                    this.preloadOffsetBytes = 0;
+                    if (offset > 0) {
+                        long skipped = 0;
+                        byte[] skipBuf = new byte[8192];
+                        while (skipped < offset) {
+                            if (Thread.currentThread().isInterrupted() || state.get() == State.STOPPED) break;
+                            int s = bin.read(skipBuf, 0, (int) Math.min(skipBuf.length, offset - skipped));
+                            if (s < 0) break;
+                            skipped += s;
+                        }
+                        long frameSize = decoded.getFrameSize();
+                        long sampleRate = (long) decoded.getSampleRate();
+                        if (frameSize > 0 && sampleRate > 0) {
+                            preloadSkipMs = skipped * 1000L / (sampleRate * frameSize);
                         }
                     }
+                    pcmSource = bin;
+                    clearPreload();
                 }
-                System.out.println("[MusicPlayer] Duration: " + currentSong.duration + "ms");
+            }
+            if (decoded == null) {
+                MusicHttp.StreamResponse response = MusicHttp.getInputStream(URI.create(url));
+                BufferedInputStream bis = new BufferedInputStream(response.body());
+                rawStream = AudioSystem.getAudioInputStream(bis);
+                AudioFormat baseFormat = rawStream.getFormat();
+
+                decoded = new AudioFormat(
+                        AudioFormat.Encoding.PCM_SIGNED,
+                        baseFormat.getSampleRate(),
+                        16,
+                        baseFormat.getChannels(),
+                        baseFormat.getChannels() * 2,
+                        baseFormat.getSampleRate(),
+                        false
+                );
+
+                pcmSource = AudioSystem.getAudioInputStream(decoded, rawStream);
+
+                // compute duration from audio stream
+                if (currentSong != null) {
+                    long frames = rawStream.getFrameLength();
+                    if (frames > 0) {
+                        currentSong.duration = (long)(frames / baseFormat.getSampleRate() * 1000);
+                    } else {
+                        long contentLength = response.headers().firstValueAsLong("Content-Length").orElse(-1);
+                        if (contentLength > 0) {
+                            int bytesPerSec = (int)(baseFormat.getSampleRate() * baseFormat.getFrameSize());
+                            if (bytesPerSec > 0) {
+                                currentSong.duration = (contentLength * 1000L) / bytesPerSec;
+                            }
+                        }
+                    }
+                    System.out.println("[MusicPlayer] Duration: " + currentSong.duration + "ms");
+                }
             }
 
             DataLine.Info info = new DataLine.Info(SourceDataLine.class, decoded);
-            localLine = (SourceDataLine) AudioSystem.getLine(info);
-            localLine.open(decoded);
-            currentLine = localLine;
-            applyVolume();
-            if (seekTargetMs < 0 && !paused) {
-                localLine.start();
+            SourceDataLine handed = pendingLine;
+            if (handed != null && handed.getFormat().matches(decoded)) {
+                // reuse the crossfade line handed over at the transition so the
+                // buffered audio keeps playing without opening a new line
+                pendingLine = null;
+                localLine = handed;
+                currentLine = localLine;
+                applyVolume();
+                if (seekTargetMs < 0 && !paused) {
+                    try { localLine.start(); } catch (Exception ignored) {}
+                }
+            } else {
+                if (handed != null) {
+                    pendingLine = null;
+                    try { handed.stop(); } catch (Exception ignored) {}
+                    try { handed.flush(); } catch (Exception ignored) {}
+                    try { handed.close(); } catch (Exception ignored) {}
+                }
+                localLine = (SourceDataLine) AudioSystem.getLine(info);
+                localLine.open(decoded);
+                currentLine = localLine;
+                applyVolume();
+                if (seekTargetMs < 0 && !paused) {
+                    localLine.start();
+                }
             }
 
             long displayedPosition = seekDisplayMs;
-            playStartMs = System.currentTimeMillis() - Math.max(0, displayedPosition);
+            if (preloadSkipMs > 0) {
+                // resuming the preloaded track from an offset: seed the clock so
+                // progress/lyrics line up with the actual audio position
+                playStartMs = System.currentTimeMillis() - preloadSkipMs;
+            } else {
+                playStartMs = System.currentTimeMillis() - Math.max(0, displayedPosition);
+            }
             totalPausedMs = 0;
             state.set(State.PLAYING);
             bytesConsumedFromStream = 0;
@@ -274,7 +598,7 @@ public class AudioPlayer {
                 byte[] skipBuffer = new byte[8192];
                 while (bytesConsumedFromStream < bytesToSkip) {
                     long remaining = bytesToSkip - bytesConsumedFromStream;
-                    int skipped = ais.read(skipBuffer, 0, (int) Math.min(skipBuffer.length, remaining));
+                    int skipped = pcmSource.read(skipBuffer, 0, (int) Math.min(skipBuffer.length, remaining));
                     if (skipped < 0) break;
                     bytesConsumedFromStream += skipped;
                 }
@@ -294,7 +618,8 @@ public class AudioPlayer {
             int pendingPcmLength = 0;
             int bytesRead;
             while (true) {
-                bytesRead = ais.read(buffer, 0, buffer.length);
+                if (crossfadeTakeover) break;
+                bytesRead = pcmSource.read(buffer, 0, buffer.length);
                 if (bytesRead == -1) {
                     reachedEnd = true;
                     break;
@@ -322,7 +647,7 @@ public class AudioPlayer {
                         while (skipped < relativeSkip) {
                             if (Thread.currentThread().isInterrupted() || state.get() == State.STOPPED) break;
                             long toRead = Math.min(skipBuf.length, relativeSkip - skipped);
-                            int n = ais.read(skipBuf, 0, (int) toRead);
+                            int n = pcmSource.read(skipBuf, 0, (int) toRead);
                             if (n < 0) break;
                             skipped += n;
                             bytesConsumedFromStream += n;
@@ -350,6 +675,31 @@ public class AudioPlayer {
                     continue;
                 }
 
+                // Melodify: preload next track when approaching the end
+                if (melodifyEnabled && !nearEndFired && nearEndListener != null
+                        && song != null && song.duration > 0) {
+                    long position = Math.max(0, System.currentTimeMillis() - playStartMs - totalPausedMs);
+                    if (song.duration - position <= PRELOAD_LEAD_MS) {
+                        nearEndFired = true;
+                        try {
+                            nearEndListener.run();
+                        } catch (Exception e) {
+                            System.err.println("[MusicPlayer] Preload trigger failed: " + e.getMessage());
+                        }
+                    }
+                }
+                // Melodify: start crossfade when preload is ready and close to the end
+                if (melodifyEnabled && !crossfadeActive && !crossfadeTakeover
+                        && preloaded != null && song != null && song.duration > 0
+                        && generation == playbackGeneration.get()) {
+                    long position = Math.max(0, System.currentTimeMillis() - playStartMs - totalPausedMs);
+                    long remaining = song.duration - position;
+                    if (remaining <= CROSSFADE_MS) {
+                        long fadeMs = Math.max(500, Math.min(CROSSFADE_MS, remaining));
+                        startCrossfade(preloaded, generation, fadeMs);
+                    }
+                }
+
                 System.arraycopy(buffer, 0, pcmBuffer, pendingPcmLength, bytesRead);
                 int pcmLength = pendingPcmLength + bytesRead;
                 int completeLength = pcmLength - pcmLength % bytesPerFrame;
@@ -367,8 +717,12 @@ public class AudioPlayer {
                 }
             }
 
-            ais.close();
-            rawStream.close();
+            if (pcmSource != null) {
+                try { pcmSource.close(); } catch (Exception ignored) {}
+            }
+            if (rawStream != null) {
+                try { rawStream.close(); } catch (Exception ignored) {}
+            }
 
             // Check for pending backward seek — restart stream from URL
             long pendingSeek = seekTargetMs;
@@ -438,4 +792,6 @@ public class AudioPlayer {
             gain.setValue(Math.max(gain.getMinimum(), Math.min(dB, gain.getMaximum())));
         }
     }
+
+    private record PreloadedTrack(SongInfo song, String url, AudioFormat format, byte[] pcm) { }
 }

@@ -5,6 +5,7 @@ import client.nilore.modules.Category;
 import client.nilore.modules.Module;
 import client.nilore.modules.impl.misc.music.MusicPlaylist;
 import client.nilore.modules.impl.misc.music.AudioPlayer;
+import client.nilore.settings.impl.BooleanSetting;
 import client.nilore.settings.impl.NumberSetting;
 
 public class MusicPlayer extends Module {
@@ -12,6 +13,13 @@ public class MusicPlayer extends Module {
     public static final MusicPlaylist PLAYLIST = new MusicPlaylist();
 
     private boolean internalVolumeChange = false;
+
+    private final BooleanSetting melodify = new BooleanSetting("Melodify", false) {
+        @Override
+        public void onChanged(Boolean oldValue, Boolean newValue) {
+            MusicPlayer.AUDIO_PLAYER.setMelodifyEnabled(newValue);
+        }
+    };
 
     private final NumberSetting volume = new NumberSetting("Volume", 90, 0, 100, 1) {
         @Override
@@ -45,5 +53,9 @@ public class MusicPlayer extends Module {
         internalVolumeChange = true;
         volume.setValue((int) (vol * 100));
         internalVolumeChange = false;
+    }
+
+    public boolean isMelodifyEnabled() {
+        return melodify.getValue();
     }
 }

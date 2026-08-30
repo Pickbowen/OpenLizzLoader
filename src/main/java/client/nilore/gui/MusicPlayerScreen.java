@@ -138,6 +138,8 @@ public class MusicPlayerScreen extends Screen {
 
     public MusicPlayerScreen() {
         super(Component.literal("Music Player"));
+        MusicPlayer.AUDIO_PLAYER.setNearEndListener(this::requestPreloadForNext);
+        MusicPlayer.AUDIO_PLAYER.setOnCrossfadeTrackListener(this::onCrossfadeTrack);
     }
 
     @Override
@@ -320,7 +322,7 @@ public class MusicPlayerScreen extends Screen {
         if (hero == null) {
             clickAreas.add(new ClickArea(textX, buttonY, buttonW, 32, () -> openPage(Page.SEARCH)));
         } else {
-            clickAreas.add(new ClickArea(x, y, w, h, () -> playSongAndOpen(hero, songs, 0, false, Page.HOME)));
+            clickAreas.add(new ClickArea(x, y, w, h, () -> playSongAndOpen(hero, songs, 0, true, Page.HOME)));
         }
     }
 
@@ -351,7 +353,7 @@ public class MusicPlayerScreen extends Screen {
             GlHelper.drawText(ellipsize(song.artist, SMALL_FONT, cardW), cardX, y + artSize + 25, SMALL_FONT, DIM);
             int index = i;
             clickAreas.add(new ClickArea(cardX, y, cardW, artSize + 38,
-                    () -> playSongAndOpen(song, songs, index, false, Page.HOME)));
+                    () -> playSongAndOpen(song, songs, index, true, Page.HOME)));
         }
     }
 
@@ -443,7 +445,7 @@ public class MusicPlayerScreen extends Screen {
                 clickAreas.add(new ClickArea(x + w - 43, rowY, 43, rowH,
                         () -> MusicPlayer.PLAYLIST.add(searchResults.get(index))));
                 clickAreas.add(new ClickArea(x, rowY, w - 48, rowH,
-                        () -> playSong(searchResults.get(index), searchResults, index, false)));
+                        () -> playSong(searchResults.get(index), searchResults, index, true)));
             }
         }
         ctx.restore();
@@ -521,7 +523,7 @@ public class MusicPlayerScreen extends Screen {
                             () -> MusicPlayer.PLAYLIST.remove(index)));
                 }
                 clickAreas.add(new ClickArea(innerX, rowY, innerW - (removable ? 49 : 0), rowH,
-                        () -> playSongAndOpen(songs.get(index), songs, index, removable,
+                        () -> playSongAndOpen(songs.get(index), songs, index, true,
                                 playlist ? Page.PLAYLIST : Page.QUEUE)));
             }
         }
@@ -991,6 +993,13 @@ public class MusicPlayerScreen extends Screen {
                 }
             } catch (Exception ignored) { }
         });
+        if (MusicPlayer.AUDIO_PLAYER.isPreloadedFor(song)) {
+            String preloadedUrl = MusicPlayer.AUDIO_PLAYER.getPreloadedUrl(song);
+            if (preloadedUrl != null) {
+                startPlayback(song, preloadedUrl, request, autoAdvance, true);
+                return;
+            }
+        }
         NeteaseApi.getSongUrl(song.id).thenAccept(result -> {
             if (result == null || playRequestSeq.get() != request) {
                 return;
@@ -1008,8 +1017,12 @@ public class MusicPlayerScreen extends Screen {
     }
 
     private void startPlayback(SongInfo song, String url, long request, boolean autoAdvance) {
+        startPlayback(song, url, request, autoAdvance, false);
+    }
+
+    private void startPlayback(SongInfo song, String url, long request, boolean autoAdvance, boolean usePreload) {
         if (playRequestSeq.get() == request) {
-            MusicPlayer.AUDIO_PLAYER.play(song, url, autoAdvance ? () -> playNextFromPlaylist(request) : null);
+            MusicPlayer.AUDIO_PLAYER.play(song, url, autoAdvance ? () -> playNextFromPlaylist(request) : null, usePreload);
         }
     }
 
@@ -1019,6 +1032,53 @@ public class MusicPlayerScreen extends Screen {
         }
         int next = (queueIndex + 1) % playQueue.size();
         playSong(playQueue.get(next), playQueue, next, true);
+    }
+
+    private void onCrossfadeTrack() {
+        SongInfo song = MusicPlayer.AUDIO_PLAYER.getCurrentSong();
+        if (song == null) {
+            return;
+        }
+        for (int i = 0; i < playQueue.size(); i++) {
+            if (playQueue.get(i).id == song.id) {
+                queueIndex = i;
+                break;
+            }
+        }
+        lyricSongId = -1;
+        if (lyricsCache.containsKey(song.id)) {
+            return;
+        }
+        NeteaseApi.getLyrics(song.id).thenAccept(lines -> {
+            List<LyricLine> safeLines = lines == null ? List.of() : lines;
+            lyricsCache.put(song.id, safeLines);
+            lyricsRequested.put(song.id, true);
+            try {
+                LyricsModule module = NiloreClient.getInstance().getModuleManager().getModule(LyricsModule.class);
+                if (module != null) {
+                    module.setLyrics(song.id, safeLines);
+                }
+            } catch (Exception ignored) { }
+        });
+    }
+
+    private void requestPreloadForNext() {
+        if (!MusicPlayer.AUDIO_PLAYER.isMelodifyEnabled() || !playlistAutoAdvance
+                || playQueue.isEmpty() || queueIndex < 0) {
+            return;
+        }
+        int next = (queueIndex + 1) % playQueue.size();
+        SongInfo nextSong = playQueue.get(next);
+        if (nextSong == null || MusicPlayer.AUDIO_PLAYER.isPreloadedFor(nextSong)) {
+            return;
+        }
+        NeteaseApi.getSongUrl(nextSong.id).thenAccept(result -> {
+            if (result == null || result.url() == null || result.url().isBlank()
+                    || MusicPlayer.AUDIO_PLAYER.isPreloadedFor(nextSong)) {
+                return;
+            }
+            MusicPlayer.AUDIO_PLAYER.preloadNext(nextSong, result.url());
+        });
     }
 
     private void nextSong() {
