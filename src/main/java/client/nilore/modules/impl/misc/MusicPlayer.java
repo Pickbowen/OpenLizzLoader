@@ -21,6 +21,13 @@ public class MusicPlayer extends Module {
         }
     };
 
+    private final NumberSetting crossfade = new NumberSetting("Crossfade", 12, 4, 20, 1) {
+        @Override
+        public void onChanged(Number oldValue, Number newValue) {
+            MusicPlayer.AUDIO_PLAYER.setCrossfadeMs(newValue.intValue() * 1000L);
+        }
+    };
+
     private final NumberSetting volume = new NumberSetting("Volume", 90, 0, 100, 1) {
         @Override
         public void onChanged(Number oldValue, Number newValue) {
@@ -33,6 +40,8 @@ public class MusicPlayer extends Module {
 
     public MusicPlayer() {
         super("MusicPlayer", Category.MISC);
+        // Crossfade only makes sense when Melodify (preload+crossfade) is on
+        crossfade.setVisibility(() -> melodify.getValue());
     }
 
     @Override

@@ -11,6 +11,9 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.URI;
+import java.util.Arrays;
+import client.nilore.modules.impl.misc.music.dsp.ChorusDetector;
+import client.nilore.modules.impl.misc.music.dsp.PitchGlide;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.concurrent.atomic.AtomicLong;
@@ -45,7 +48,7 @@ public class AudioPlayer {
     private volatile long bytesConsumedFromStream = 0;
 
     // melodify seamless next-track preloading
-    public static final long PRELOAD_LEAD_MS = 20000;
+    public static final long PRELOAD_LEAD_MS = 30000;
     private volatile boolean melodifyEnabled;
     private volatile Runnable nearEndListener;
     private volatile boolean nearEndFired;
@@ -53,8 +56,11 @@ public class AudioPlayer {
     private volatile boolean usePreload;
 
     // crossfade: overlap fade-out/fade-in between current and preloaded next track
-    public static final long CROSSFADE_MS = 12000;
+    private volatile long crossfadeMs = 12000;
     private volatile boolean crossfadeActive;
+    private volatile boolean glideEnabled = true;
+    private static final float GLIDE_HEAD_SEC = 1.0f;
+    private static final float GLIDE_FROM = 0.94f;
     private volatile boolean crossfadeTakeover;
     private volatile SourceDataLine crossfadeLine;
     private volatile SourceDataLine pendingLine;
@@ -62,6 +68,11 @@ public class AudioPlayer {
     private volatile long pendingPreloadOffset;
     private volatile Runnable crossfadeCallback;
     private volatile Runnable onCrossfadeTrackListener;
+    // outgoing track snapshot taken when a crossfade starts; used to restore the
+    // UI if the fade fails before handing off to the next track
+    private volatile SongInfo crossfadeOriginSong;
+    private volatile String crossfadeOriginUrl;
+    private volatile long crossfadeOriginPlayStartMs;
 
     public void play(SongInfo song, String url) {
         play(song, url, null, false);
@@ -171,6 +182,10 @@ public class AudioPlayer {
         this.onCrossfadeTrackListener = listener;
     }
 
+    public void setCrossfadeMs(long ms) {
+        this.crossfadeMs = Math.max(0, ms);
+    }
+
     public boolean isPreloadedFor(SongInfo song) {
         PreloadedTrack pre = preloaded;
         return pre != null && pre.pcm != null && song != null && pre.song.id == song.id;
@@ -200,7 +215,8 @@ public class AudioPlayer {
             if (track != null && generation == playbackGeneration.get()
                     && state.get() != State.STOPPED && melodifyEnabled) {
                 this.preloaded = track;
-                System.out.println("[MusicPlayer] Preloaded: " + song.name);
+                System.out.println("[MusicPlayer] Preloaded: " + song.name
+                        + " (chorus @" + track.chorusStartSec + "s, dur " + track.chorusDurationSec + "s)");
             }
         }, "MusicPlayer-Preload");
         thread.setDaemon(true);
@@ -233,13 +249,48 @@ public class AudioPlayer {
                     }
                     out.write(buf, 0, n);
                 }
+                byte[] pcm = out.toByteArray();
                 if (song.duration <= 0) {
-                    long frames = rawStream.getFrameLength();
-                    if (frames > 0) {
-                        song.duration = (long) (frames / baseFormat.getSampleRate() * 1000);
+                    // whole track is decoded in memory: compute an exact duration
+                    // from the PCM length so progress/lyrics work on seamless playback
+                    int frameSize = decoded.getFrameSize();
+                    int rate = (int) decoded.getSampleRate();
+                    long pcmFrames = frameSize > 0 ? pcm.length / frameSize : 0;
+                    if (pcmFrames > 0 && rate > 0) {
+                        song.duration = pcmFrames * 1000 / rate;
                     }
                 }
-                return new PreloadedTrack(song, url, decoded, out.toByteArray());
+                int channels = decoded.getChannels();
+                int sampleRate = (int) decoded.getSampleRate();
+                float chorusStart = 0f;
+                float chorusDur = 0f;
+                // chorus section detection (pychorus-style), best-effort
+                if (pcm.length > 0 && sampleRate > 0 && channels > 0) {
+                    try {
+                        float[] mono = toFloatMono(pcm, channels);
+                        ChorusDetector.Result r = ChorusDetector.detect(mono, sampleRate);
+                        chorusStart = r.chorusStartSec;
+                        chorusDur = r.chorusDurationSec;
+                    } catch (Exception e) {
+                        System.err.println("[MusicPlayer] Chorus detect failed: " + e.getMessage());
+                    }
+                }
+                // optional pitch-glide on the intro so crossfade transitions pull in
+                if (glideEnabled && sampleRate > 0 && channels > 0) {
+                    int headBytes = (int) (GLIDE_HEAD_SEC * sampleRate * channels * 2);
+                    if (pcm.length > headBytes) {
+                        byte[] head = Arrays.copyOfRange(pcm, 0, headBytes);
+                        byte[] glided = PitchGlide.glide(head, channels, GLIDE_FROM, 1.0f);
+                        byte[] rest = Arrays.copyOfRange(pcm, headBytes, pcm.length);
+                        byte[] merged = new byte[glided.length + rest.length];
+                        System.arraycopy(glided, 0, merged, 0, glided.length);
+                        System.arraycopy(rest, 0, merged, glided.length, rest.length);
+                        pcm = merged;
+                    }
+                }
+                song.chorusStartSec = chorusStart;
+                song.chorusDurationSec = chorusDur;
+                return new PreloadedTrack(song, url, decoded, pcm, chorusStart, chorusDur);
             } finally {
                 try { ais.close(); } catch (Exception ignored) {}
             }
@@ -252,7 +303,28 @@ public class AudioPlayer {
 
     private void startCrossfade(PreloadedTrack track, long generation, long fadeMs) {
         if (track == null || track.pcm == null || track.pcm.length == 0) return;
+        // remember the outgoing track so a failed fade can restore the UI
+        this.crossfadeOriginSong = currentSong;
+        this.crossfadeOriginUrl = currentUrl;
+        this.crossfadeOriginPlayStartMs = playStartMs;
         crossfadeActive = true;
+        System.out.println("[MusicPlayer] Crossfade start -> " + track.song.name + " fade=" + fadeMs + "ms");
+        // Switch the UI to the incoming track right away (name/cover/lyrics and
+        // progress all start from 0, in sync with the fade-in), rather than
+        // waiting for the handoff at the end of the fade.
+        this.currentSong = track.song;
+        this.currentUrl = track.url;
+        this.paused = false;
+        this.totalPausedMs = 0;
+        this.playStartMs = System.currentTimeMillis();
+        this.seekTargetMs = -1;
+        this.seekDisplayMs = -1;
+        Runnable notifier = onCrossfadeTrackListener;
+        if (notifier != null) {
+            try { notifier.run(); } catch (Exception e) {
+                System.err.println("[MusicPlayer] Crossfade UI switch failed: " + e.getMessage());
+            }
+        }
         Thread thread = new Thread(() -> runCrossfade(track, generation, fadeMs), "MusicPlayer-Crossfade");
         thread.setDaemon(true);
         thread.start();
@@ -275,6 +347,10 @@ public class AudioPlayer {
             while ((n = in.read(buf)) != -1) {
                 if (generation != playbackGeneration.get() || state.get() == State.STOPPED
                         || crossfadeLine != bLine) {
+                    System.out.println("[MusicPlayer] Crossfade ABORTED"
+                            + (generation != playbackGeneration.get() ? " gen" : "")
+                            + (state.get() == State.STOPPED ? " stopped" : "")
+                            + (crossfadeLine != bLine ? " line" : ""));
                     break;
                 }
                 long elapsed = System.currentTimeMillis() - start;
@@ -301,12 +377,16 @@ public class AudioPlayer {
         } finally {
             crossfadeLine = null;
             crossfadeActive = false;
+            System.out.println("[MusicPlayer] Crossfade end fadeCompleted=" + fadeCompleted
+                    + " consumed=" + consumed);
             // If the fade finished first, take over playback of the preloaded
             // track right here on this thread, reusing bLine. No new thread,
             // no new SourceDataLine, no gap: the buffered audio keeps flowing.
             if (fadeCompleted && generation == playbackGeneration.get()
                     && consumed > 0) {
                 long gen = playbackGeneration.incrementAndGet();
+                System.out.println("[MusicPlayer] Handoff -> " + track.song.name
+                        + " offset=" + consumed + " bytes");
                 this.pendingPreloadOffset = consumed;
                 this.currentSong = track.song;
                 this.currentUrl = track.url;
@@ -334,6 +414,25 @@ public class AudioPlayer {
                 playInternal(track.url, gen, track.song, crossfadeCallback);
                 return;
             }
+            // The fade did not complete (aborted / line failed). The UI was
+            // already switched to the incoming track at crossfade start, so
+            // restore the outgoing track - unless a manual switch or a stop
+            // took over playback in the meantime.
+            if (!fadeCompleted && generation == playbackGeneration.get()
+                    && state.get() != State.STOPPED && crossfadeOriginSong != null) {
+                this.currentSong = crossfadeOriginSong;
+                this.currentUrl = crossfadeOriginUrl;
+                this.playStartMs = crossfadeOriginPlayStartMs;
+                this.crossfadeOriginSong = null;
+                System.out.println("[MusicPlayer] Crossfade restored -> " + currentSong.name);
+                Runnable notifier = onCrossfadeTrackListener;
+                if (notifier != null) {
+                    try { notifier.run(); } catch (Exception e) {
+                        System.err.println("[MusicPlayer] Crossfade UI restore failed: " + e.getMessage());
+                    }
+                }
+            }
+            this.crossfadeOriginSong = null;
             if (bLine != null) {
                 // drain the line's buffer before closing so the preloaded audio
                 // already fed to the device keeps playing; otherwise the takeover
@@ -372,6 +471,23 @@ public class AudioPlayer {
                 pcm[offset + 1] = (byte) ((scaled >>> 8) & 0xFF);
             }
         }
+    }
+
+    private static float[] toFloatMono(byte[] pcm, int channels) {
+        int frameSize = channels * 2;
+        int frames = pcm.length / frameSize;
+        float[] out = new float[frames];
+        for (int f = 0; f < frames; f++) {
+            int off = f * frameSize;
+            float sum = 0f;
+            for (int ch = 0; ch < channels; ch++) {
+                int idx = off + ch * 2;
+                short s = (short) ((pcm[idx] & 0xFF) | (pcm[idx + 1] << 8));
+                sum += s / 32768f;
+            }
+            out[f] = sum / channels;
+        }
+        return out;
     }
 
     public void setVolume(float vol) {
@@ -528,21 +644,17 @@ public class AudioPlayer {
 
                 pcmSource = AudioSystem.getAudioInputStream(decoded, rawStream);
 
-                // compute duration from audio stream
+                // compute duration from audio stream. Only trust the frame count
+                // (reliable); the Content-Length/bytes-per-sec guess is often badly
+                // wrong for compressed formats (AAC frameSize=1 → duration overestimated
+                // → preload/crossfade never fire early → next track restarts from 0).
+                // playSong already estimated duration from the API size, keep that.
                 if (currentSong != null) {
                     long frames = rawStream.getFrameLength();
                     if (frames > 0) {
                         currentSong.duration = (long)(frames / baseFormat.getSampleRate() * 1000);
-                    } else {
-                        long contentLength = response.headers().firstValueAsLong("Content-Length").orElse(-1);
-                        if (contentLength > 0) {
-                            int bytesPerSec = (int)(baseFormat.getSampleRate() * baseFormat.getFrameSize());
-                            if (bytesPerSec > 0) {
-                                currentSong.duration = (contentLength * 1000L) / bytesPerSec;
-                            }
-                        }
+                        System.out.println("[MusicPlayer] Duration: " + currentSong.duration + "ms");
                     }
-                    System.out.println("[MusicPlayer] Duration: " + currentSong.duration + "ms");
                 }
             }
 
@@ -579,6 +691,7 @@ public class AudioPlayer {
                 // resuming the preloaded track from an offset: seed the clock so
                 // progress/lyrics line up with the actual audio position
                 playStartMs = System.currentTimeMillis() - preloadSkipMs;
+                System.out.println("[MusicPlayer] Resumed " + song.name + " at " + preloadSkipMs + "ms");
             } else {
                 playStartMs = System.currentTimeMillis() - Math.max(0, displayedPosition);
             }
@@ -688,14 +801,30 @@ public class AudioPlayer {
                         }
                     }
                 }
-                // Melodify: start crossfade when preload is ready and close to the end
-                if (melodifyEnabled && !crossfadeActive && !crossfadeTakeover
+                // Melodify: start crossfade when preload is ready and close to the end.
+                // Transition length = min(crossfadeMs, time from chorus end to track end),
+                // so the fade starts at the chorus (peak) end when the chorus sits near
+                // the end of the track; otherwise it uses the fixed crossfade window.
+                if (melodifyEnabled && crossfadeMs > 0 && !crossfadeActive && !crossfadeTakeover
                         && preloaded != null && song != null && song.duration > 0
                         && generation == playbackGeneration.get()) {
                     long position = Math.max(0, System.currentTimeMillis() - playStartMs - totalPausedMs);
                     long remaining = song.duration - position;
-                    if (remaining <= CROSSFADE_MS) {
-                        long fadeMs = Math.max(500, Math.min(CROSSFADE_MS, remaining));
+                    long transitionMs = crossfadeMs;
+                    if (song.chorusDurationSec > 0) {
+                        long chorusEndMs = (long) ((song.chorusStartSec + song.chorusDurationSec) * 1000);
+                        long chorusTailMs = song.duration - chorusEndMs;
+                        // the chorus may pull the transition EARLIER (fade starts
+                        // at the chorus end) but never later than the fixed window:
+                        // a chorus ending right at the track end would otherwise
+                        // delay the fade until playback has almost finished.
+                        long floorMs = Math.max(3000, crossfadeMs / 2);
+                        if (chorusTailMs >= floorMs && chorusTailMs < crossfadeMs) {
+                            transitionMs = chorusTailMs;
+                        }
+                    }
+                    if (remaining <= transitionMs) {
+                        long fadeMs = Math.max(500, Math.min(transitionMs, remaining));
                         startCrossfade(preloaded, generation, fadeMs);
                     }
                 }
@@ -736,7 +865,7 @@ public class AudioPlayer {
             naturalEnd = reachedEnd
                     && state.get() == State.PLAYING
                     && generation == playbackGeneration.get();
-            if (naturalEnd) {
+            if (naturalEnd && !crossfadeActive) {
                 state.set(State.STOPPED);
                 spectrumSnapshot.set(new float[0]);
             }
@@ -753,7 +882,10 @@ public class AudioPlayer {
         } finally {
             if (localLine != null) {
                 try {
-                    if (naturalEnd) {
+                    // during a crossfade the current track is already faded out
+                    // and will be taken over — draining its buffer only causes a
+                    // stutter (Playback finished), so drop it immediately instead.
+                    if (naturalEnd && !crossfadeActive) {
                         localLine.drain();
                     } else {
                         localLine.stop();
@@ -763,7 +895,10 @@ public class AudioPlayer {
                 try { localLine.close(); } catch (Exception ignored) {}
                 if (currentLine == localLine) currentLine = null;
             }
-            if (naturalEnd && generation == playbackGeneration.get() && onNaturalEnd != null) {
+            // crossfade will hand off to the next track itself, so a natural end
+            // of the current track while crossfading must not start its own switch
+            if (naturalEnd && !crossfadeActive && generation == playbackGeneration.get()
+                    && onNaturalEnd != null) {
                 onNaturalEnd.run();
             }
         }
@@ -793,5 +928,6 @@ public class AudioPlayer {
         }
     }
 
-    private record PreloadedTrack(SongInfo song, String url, AudioFormat format, byte[] pcm) { }
+    private record PreloadedTrack(SongInfo song, String url, AudioFormat format, byte[] pcm,
+                                  float chorusStartSec, float chorusDurationSec) { }
 }

@@ -45,9 +45,6 @@ import client.nilore.event.impl.SlowdownEvent;
 import client.nilore.event.impl.TickEvent;
 import client.nilore.modules.Category;
 import client.nilore.modules.Module;
-import client.nilore.settings.impl.BooleanSetting;
-import client.nilore.settings.impl.NumberSetting;
-import client.nilore.utils.animation.Timer;
 import client.nilore.utils.misc.PacketUtil;
 import client.nilore.event.EventTarget;
 
@@ -57,16 +54,6 @@ public class NoSlow extends Module {
 
     private enum Step { NONE, ARMED, EATING }
 
-    public final BooleanSetting bowNoSlow      = new BooleanSetting("Bow", false);
-    public final BooleanSetting keepSprinting  = new BooleanSetting("Keep Sprinting", true);
-    public final BooleanSetting crossbowNoSlow = new BooleanSetting("Crossbow", false);
-    public final BooleanSetting foodNoSlow     = new BooleanSetting("Food", true);
-    public final BooleanSetting potionNoSlow   = new BooleanSetting("Potion", true);
-    public final BooleanSetting shieldNoSlow   = new BooleanSetting("Shield NoSlow", true);
-    public final NumberSetting useItemTicks    = new NumberSetting("Use Item Ticks", 1, 1, 20, 1,
-            this.bowNoSlow::getValue);
-
-    private final Timer timer = new Timer();
     private final Queue<Packet<ClientGamePacketListener>> inboundQueue = new ArrayDeque<>();
     private InteractionHand useHand     = InteractionHand.MAIN_HAND;
     private InteractionHand lastUseHand = InteractionHand.MAIN_HAND;
@@ -126,18 +113,13 @@ public class NoSlow extends Module {
         // 食物/药水/盾牌: 不依赖 Bow 开关, 始终取消减速(vanilla 吃, 不换手, 否则快吃完时换手打断最后几口吃不上)
         if (this.isEatOrDrink(stack) || stack.getUseAnimation() == UseAnim.BLOCK) {
             event.setSlowDown(false);
-            if (this.keepSprinting.getValue()) {
-                mc.player.setSprinting(true);
-            }
+            mc.player.setSprinting(true);
             return;
         }
-        // res 弓: 弓类使用中(bowActive)由状态机取消减速(需 Bow 开关)
-        if (!(Boolean) this.bowNoSlow.getValue()) return;
+        // res 弓: 弓类使用中(bowActive)由状态机取消减速
         if (this.bowActive) {
             event.setSlowDown(false);
-            if (this.keepSprinting.getValue()) {
-                mc.player.setSprinting(true);
-            }
+            mc.player.setSprinting(true);
         }
     }
 
@@ -146,6 +128,13 @@ public class NoSlow extends Module {
         if (mc.player == null) {
             this.release();
             this.stopBlink();
+            return;
+        }
+        // 桌面 һoе: Scaffold 开启或主手持末影珍珠时 NoSlow 不干预(避免冲突), 复位
+        if ((step != Step.NONE || this.bowActive)
+                && ((Scaffold.INSTANCE != null && Scaffold.INSTANCE.isEnabled())
+                    || mc.player.getMainHandItem().is(Items.ENDER_PEARL))) {
+            this.release();
             return;
         }
         if (this.isBlinking) {
@@ -210,21 +199,20 @@ public class NoSlow extends Module {
             this.finishBlink();
             return;
         }
-        if (this.bowNoSlow.getValue() && this.didSwapHand && !this.isBlinking) {
+        if (this.didSwapHand && !this.isBlinking) {
             if (this.useHand != this.lastUseHand) {
                 this.sendSwapOffhand();
             }
             releaseItemSent = true;
             this.didSwapHand = false;
             this.shouldReleaseItem = false;
-            this.timer.reset();
-            this.releaseTicksRemaining = this.useItemTicks.getValue().intValue();
+            this.releaseTicksRemaining = 1;
             this.releaseUseKey();
             PacketUtil.sendQueued(new ServerboundPlayerActionPacket(
                     ServerboundPlayerActionPacket.Action.RELEASE_USE_ITEM, BlockPos.ZERO, Direction.DOWN));
             return;
         }
-        if (this.bowNoSlow.getValue() && this.shouldReleaseItem
+        if (this.shouldReleaseItem
                 && mc.player.isUsingItem() && this.canSwapHands()) {
             this.shouldReleaseItem = false;
             this.startUseItemDefault(mc.player.getUsedItemHand());
@@ -308,16 +296,12 @@ public class NoSlow extends Module {
         if (event.getPacket() instanceof ServerboundUseItemPacket usePacket) {
             if (this.didSwapHand || this.releaseTicksRemaining > 0) {
                 event.setCancelled(true);
-            } else if (this.bowNoSlow.getValue()) {
-                if (!this.timer.hasPassed(150.0f) && this.releaseTicksRemaining <= 0) {
-                    event.setCancelled(true);
-                } else {
-                    ItemStack handStack = mc.player.getItemInHand(usePacket.getHand());
-                    // res һesсјјp 弓分支(jсоijсі(false)): 弓类不换手, 标记取消减速 + 延迟入站包, 放行 UseItem
-                    // 食物/药水/盾牌: 走 vanilla(不换手不打断), 由 onSlowdown 取消减速
-                    if (this.isBowLike(handStack.getUseAnimation())) {
-                        this.handleBowUseItem(handStack);
-                    }
+            } else {
+                ItemStack handStack = mc.player.getItemInHand(usePacket.getHand());
+                // res һesсјјp 弓分支(jсоijсі(false)): 弓类不换手, 标记取消减速 + 延迟入站包, 放行 UseItem
+                // 食物/药水/盾牌: 走 vanilla(不换手不打断), 由 onSlowdown 取消减速
+                if (this.isBowLike(handStack.getUseAnimation())) {
+                    this.handleBowUseItem(handStack);
                 }
             }
         }
@@ -353,8 +337,7 @@ public class NoSlow extends Module {
         }
         releaseItemSent = true;
         this.didSwapHand = false;
-        this.timer.reset();
-        this.releaseTicksRemaining = this.useItemTicks.getValue().intValue();
+        this.releaseTicksRemaining = 1;
         this.releaseUseKey();
         PacketUtil.sendQueued(new ServerboundPlayerActionPacket(
                 ServerboundPlayerActionPacket.Action.RELEASE_USE_ITEM, BlockPos.ZERO, Direction.DOWN));
@@ -375,7 +358,7 @@ public class NoSlow extends Module {
     }
 
     private boolean isBlockingInternal(Minecraft minecraft) {
-        if (!this.isEnabled() || this.bowNoSlow.getValue()) return false;
+        if (!this.isEnabled()) return false;
         if (minecraft == null || minecraft.player == null || minecraft.hitResult == null) return false;
         if (minecraft.hitResult.getType() != HitResult.Type.BLOCK) return false;
         for (InteractionHand hand : InteractionHand.values()) {
@@ -498,9 +481,7 @@ public class NoSlow extends Module {
         if (stack.isEmpty()) return false;
         UseAnim anim = stack.getUseAnimation();
         Item item = stack.getItem();
-        return anim == UseAnim.EAT && this.potionNoSlow.getValue()
-                || anim == UseAnim.DRINK && this.shieldNoSlow.getValue()
-                || item instanceof PotionItem && this.shieldNoSlow.getValue();
+        return anim == UseAnim.EAT || anim == UseAnim.DRINK || item instanceof PotionItem;
     }
 
     // res pјіеoc 弓类判定: BOW/CROSSBOW/SPEAR
