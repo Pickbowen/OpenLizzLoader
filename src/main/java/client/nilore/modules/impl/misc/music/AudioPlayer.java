@@ -61,6 +61,9 @@ public class AudioPlayer {
     private volatile boolean glideEnabled = true;
     private static final float GLIDE_HEAD_SEC = 1.0f;
     private static final float GLIDE_FROM = 0.94f;
+    // cap on how deep the chorus jump may go into the next track (seconds):
+    // a late-detected chorus must not start the next song at 1min+.
+    private static final float MAX_CHORUS_JUMP_SEC = 60f;
     private volatile boolean crossfadeTakeover;
     private volatile SourceDataLine crossfadeLine;
     private volatile SourceDataLine pendingLine;
@@ -68,6 +71,9 @@ public class AudioPlayer {
     private volatile long pendingPreloadOffset;
     private volatile Runnable crossfadeCallback;
     private volatile Runnable onCrossfadeTrackListener;
+    // byte offset into the preloaded track PCM where the crossfade starts
+    // (0 = from the very beginning); used to jump into the next track's chorus
+    private volatile long crossfadeStartOffset;
     // outgoing track snapshot taken when a crossfade starts; used to restore the
     // UI if the fade fails before handing off to the next track
     private volatile SongInfo crossfadeOriginSong;
@@ -139,6 +145,7 @@ public class AudioPlayer {
         crossfadeActive = false;
         crossfadeTakeover = true;
         crossfadeLine = null;
+        crossfadeStartOffset = 0;
         currentSong = null;
         currentUrl = null;
         if (currentLine != null) {
@@ -319,20 +326,78 @@ public class AudioPlayer {
         this.playStartMs = System.currentTimeMillis();
         this.seekTargetMs = -1;
         this.seekDisplayMs = -1;
+        // jump the incoming track to its chorus entrance instead of 00:00 so the
+        // seamless transition lands on the peak of the next song
+        long chorusOffset = computeChorusByteOffset(track, fadeMs);
+        this.crossfadeStartOffset = chorusOffset;
+        if (chorusOffset > 0L && track.format != null) {
+            byte[] glided = buildGlidedPcm(track.pcm, track.format.getChannels(),
+                    (long) track.format.getSampleRate(), chorusOffset);
+            track = new PreloadedTrack(track.song, track.url, track.format, glided,
+                    track.chorusStartSec, track.chorusDurationSec);
+            this.preloaded = track;   // playInternal resumes from the same array after the fade
+            long chorusMs = chorusOffset * 1000L
+                    / ((long) track.format.getSampleRate() * track.format.getFrameSize());
+            // clock starts at the chorus so the progress bar / lyrics align immediately
+            this.playStartMs = System.currentTimeMillis() - chorusMs;
+            System.out.println("[MusicPlayer] Crossfade starts next track at chorus "
+                    + chorusMs + "ms (offset=" + chorusOffset + "B)");
+        }
         Runnable notifier = onCrossfadeTrackListener;
         if (notifier != null) {
             try { notifier.run(); } catch (Exception e) {
                 System.err.println("[MusicPlayer] Crossfade UI switch failed: " + e.getMessage());
             }
         }
-        Thread thread = new Thread(() -> runCrossfade(track, generation, fadeMs), "MusicPlayer-Crossfade");
+        final PreloadedTrack fadeTrack = track;
+        Thread thread = new Thread(() -> runCrossfade(fadeTrack, generation, fadeMs), "MusicPlayer-Crossfade");
         thread.setDaemon(true);
         thread.start();
     }
 
+    // Byte offset of the chorus entrance (frame-aligned). Valid only when the
+    // chorus leaves room for a 1s glide head and enough audio after it to finish
+    // the fade — otherwise a mid-fade EOF would trip the failure-restore path.
+    private long computeChorusByteOffset(PreloadedTrack track, long fadeMs) {
+        if (track == null || track.format == null || track.pcm == null) return 0L;
+        int sampleRate = (int) track.format.getSampleRate();
+        int frameSize = track.format.getFrameSize();
+        if (sampleRate <= 0 || frameSize <= 0 || track.chorusStartSec <= 0f) return 0L;
+        // clamp into [0, MAX_CHORUS_JUMP_SEC]: keep the detected chorus position
+        // as-is when it is inside the window, and land on the nearest allowed
+        // boundary when it overshoots.
+        float chorusStart = Math.max(0f, Math.min(track.chorusStartSec, MAX_CHORUS_JUMP_SEC));
+        long offset = (long) (chorusStart * sampleRate) * frameSize;
+        long headBytes = (long) (GLIDE_HEAD_SEC * sampleRate) * frameSize;
+        long fadeBytes = (fadeMs * sampleRate * frameSize) / 1000L;
+        if (offset < 0L || offset + headBytes + fadeBytes > track.pcm.length) return 0L;
+        return offset;
+    }
+
+    // New array: pcm[0..offset) untouched + chorus entrance 1s glided 0.94 -> 1.0
+    // (output grows) + the rest untouched. The length change is absorbed by the
+    // new array, so `offset` keeps its meaning as an absolute position.
+    private byte[] buildGlidedPcm(byte[] pcm, int channels, long sampleRate, long offset) {
+        int frameSize = channels * 2;
+        long headBytes = (long) (GLIDE_HEAD_SEC * sampleRate) * frameSize;
+        int off = (int) offset;
+        int headLen = (int) headBytes;
+        if (off < 0 || headLen <= 0 || off + headLen > pcm.length) return pcm;
+        byte[] head = Arrays.copyOfRange(pcm, off, off + headLen);
+        byte[] glided = PitchGlide.glide(head, channels, GLIDE_FROM, 1.0f);
+        byte[] out = new byte[pcm.length - headLen + glided.length];
+        System.arraycopy(pcm, 0, out, 0, off);
+        System.arraycopy(glided, 0, out, off, glided.length);
+        System.arraycopy(pcm, off + headLen, out, off + glided.length, pcm.length - off - headLen);
+        return out;
+    }
+
     private void runCrossfade(PreloadedTrack track, long generation, long fadeMs) {
         SourceDataLine bLine = null;
-        long consumed = 0;
+        // consumed is an ABSOLUTE byte position in track.pcm: seeded with the
+        // chorus jump so the handoff (and each per-frame offset) continues from
+        // the chorus entrance instead of counting from the fade start.
+        long consumed = crossfadeStartOffset;
         boolean fadeCompleted = false;
         try {
             bLine = (SourceDataLine) AudioSystem.getLine(new DataLine.Info(SourceDataLine.class, track.format));
@@ -340,6 +405,14 @@ public class AudioPlayer {
             crossfadeLine = bLine;
             bLine.start();
             ByteArrayInputStream in = new ByteArrayInputStream(track.pcm);
+            // skip the chorus entrance when jumping into the next track's peak
+            long skipLeft = crossfadeStartOffset;
+            byte[] skipBuf = new byte[8192];
+            while (skipLeft > 0L) {
+                int s = in.read(skipBuf, 0, (int) Math.min(skipBuf.length, skipLeft));
+                if (s < 0) break;
+                skipLeft -= s;
+            }
             byte[] buf = new byte[4096];
             int channels = track.format.getChannels();
             long start = System.currentTimeMillis();
@@ -387,11 +460,15 @@ public class AudioPlayer {
                 long gen = playbackGeneration.incrementAndGet();
                 System.out.println("[MusicPlayer] Handoff -> " + track.song.name
                         + " offset=" + consumed + " bytes");
-                this.pendingPreloadOffset = consumed;
                 this.currentSong = track.song;
                 this.currentUrl = track.url;
                 this.usePreload = true;
                 this.preloadOffsetBytes = consumed;
+                // `consumed` (absolute, incl. the chorus jump) is handed straight
+                // to preloadOffsetBytes for this track; reset pendingPreloadOffset
+                // so the NEXT preloaded track (play(..., usePreload=true)) starts
+                // from 00:00 instead of inheriting this track's chorus offset.
+                this.pendingPreloadOffset = 0;
                 this.nearEndFired = false;
                 this.crossfadeTakeover = false;
                 this.paused = false;
@@ -424,6 +501,9 @@ public class AudioPlayer {
                 this.currentUrl = crossfadeOriginUrl;
                 this.playStartMs = crossfadeOriginPlayStartMs;
                 this.crossfadeOriginSong = null;
+                // drop the glided/preloaded copy so a later natural end of this
+                // track does not reuse the chorus-glided array from 00:00
+                clearPreload();
                 System.out.println("[MusicPlayer] Crossfade restored -> " + currentSong.name);
                 Runnable notifier = onCrossfadeTrackListener;
                 if (notifier != null) {

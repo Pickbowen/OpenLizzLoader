@@ -198,10 +198,44 @@ public final class ChorusDetector {
                     }
                 }
             }
+            // Prefer the candidate CLOSEST to 0:00: any chunk that repeats as
+            // often as the max (within a small slack, so a near-max repeat still
+            // counts as a genuine candidate) is a valid chorus start; among those
+            // pick the one whose merged section starts earliest.
+            int maxRepeat = 0;
+            for (int c : repeatCount) if (c > maxRepeat) maxRepeat = c;
             int best = -1;
-            for (int k = 0; k < K; k++) {
-                if (repeatCount[k] > 0 && (best < 0 || repeatCount[k] > repeatCount[best])) {
-                    best = k;
+            if (maxRepeat > 0) {
+                int accept = maxRepeat <= 2 ? maxRepeat : maxRepeat - 1;
+                int bestCandidate = -1;
+                for (int k = 0; k < K; k++) {
+                    if (repeatCount[k] >= accept) { bestCandidate = k; break; }
+                }
+                if (bestCandidate >= 0) {
+                    int maxFrames = (int) (MAX_CHORUS_SEC / hopSec / step) + 1;
+                    best = bestCandidate;
+                    int bestStart = Integer.MAX_VALUE;
+                    for (int k = bestCandidate; k < K; k++) {
+                        if (repeatCount[k] < accept) continue;
+                        int candLo = bestShift + k * period;
+                        int candHi = Math.min(n, bestShift + (k + 1) * period);
+                        // mimic the merge pass: extend backwards over similar
+                        // chunks, then evaluate the merged section's start
+                        int lo = candLo, hi = candHi;
+                        boolean changed = true;
+                        while (changed) {
+                            changed = false;
+                            if (lo - period >= 0 && hi - (lo - period) <= maxFrames
+                                    && segmentSimilarity(ssm, lo - period, lo, lo, hi) > MERGE_SIM_THRESHOLD) {
+                                lo -= period;
+                                changed = true;
+                            }
+                        }
+                        if (hi - lo >= (int) (MIN_CHORUS_SEC / hopSec / step) && lo < bestStart) {
+                            bestStart = lo;
+                            best = k;
+                        }
+                    }
                 }
             }
 
@@ -243,7 +277,7 @@ public final class ChorusDetector {
             float mean = mean(smoothScore);
             float std = std(smoothScore);
             float threshold = mean + 0.6f * std;
-            int bestStart = -1;
+            int bestStart = Integer.MAX_VALUE;
             int bestLen = 0;
             int runStart = -1;
             for (int i = 0; i <= n; i++) {
@@ -253,7 +287,10 @@ public final class ChorusDetector {
                 } else if (!above && runStart >= 0) {
                     int len = i - runStart;
                     float sec = len * hopSec * step;
-                    if (sec >= MIN_CHORUS_SEC && sec <= MAX_CHORUS_SEC && len > bestLen) {
+                    // among runs of comparable length (≈ top repeat energy),
+                    // prefer the one whose section starts CLOSEST to 0:00
+                    if (sec >= MIN_CHORUS_SEC && sec <= MAX_CHORUS_SEC
+                            && len >= bestLen * 0.85f && runStart < bestStart) {
                         bestStart = runStart;
                         bestLen = len;
                     }
