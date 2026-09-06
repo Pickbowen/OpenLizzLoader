@@ -72,6 +72,9 @@ public class NoSlow extends Module {
     private int noUseTicks = 0;
     private boolean bowActive;   // res apheһһ: 弓类使用中, onSlowdown 取消减速
     private boolean bowDelay;    // res xhc: 弓类使用期间延迟入站包
+    // res 换手吃: 食物(非煲/非盾) UseItem 已取消主手包 → SWAP 副手 → 副手 UseItem 进食,
+    // 进食结束/松开时由 EATING 状态机换回手。待实测(本服该方案曾"吃不上", 可能需要再调)。
+    private boolean resFoodSwap;
     private final Queue<Packet<?>> cached = new ConcurrentLinkedQueue<>();
 
     public NoSlow() {
@@ -298,8 +301,22 @@ public class NoSlow extends Module {
                 event.setCancelled(true);
             } else {
                 ItemStack handStack = mc.player.getItemInHand(usePacket.getHand());
+                // res һesсјјp 食物分支: 食物/药水(非煲/非盾/非弓) 换手吃 —— 取消主手 UseItem,
+                // SWAP 换副手, 再以副手 UseItem(同 sequence) 进食, 由 EATING 状态机在吃完/松开时换回手。
+                // 这样服务器把进食记在副手, 主手保持空闲(无减速/可随时操作), 效率优先。
+                if (this.shouldResSwapFood(usePacket.getHand(), handStack)) {
+                    this.resFoodSwap = true;
+                    event.setCancelled(true);
+                    this.sendSwapOffhand();
+                    PacketUtil.sendQueued(new ServerboundUseItemPacket(InteractionHand.OFF_HAND, usePacket.getSequence()));
+                    // 接管现有 EATING 状态: 进食期间保持右键按下, 结束/松开后由它换回手
+                    this.step = Step.EATING;
+                    this.hasSwapped = true;
+                    this.noUseTicks = 0;
+                    return;
+                }
                 // res һesсјјp 弓分支(jсоijсі(false)): 弓类不换手, 标记取消减速 + 延迟入站包, 放行 UseItem
-                // 食物/药水/盾牌: 走 vanilla(不换手不打断), 由 onSlowdown 取消减速
+                // 盾牌(BLOCK): 走 vanilla(不换手不打断), 由 onSlowdown 取消减速
                 if (this.isBowLike(handStack.getUseAnimation())) {
                     this.handleBowUseItem(handStack);
                 }
@@ -393,6 +410,7 @@ public class NoSlow extends Module {
         hasSwapped = false;
         swapInArmed = false;
         noUseTicks = 0;
+        resFoodSwap = false;
         cached.clear();
     }
 
@@ -403,6 +421,7 @@ public class NoSlow extends Module {
         step = Step.NONE;
         noUseTicks = 0;
         swapInArmed = false;
+        resFoodSwap = false;
         if (mc.player == null || mc.getConnection() == null) {
             cached.clear();
             inboundQueue.clear();
@@ -482,6 +501,21 @@ public class NoSlow extends Module {
         UseAnim anim = stack.getUseAnimation();
         Item item = stack.getItem();
         return anim == UseAnim.EAT || anim == UseAnim.DRINK || item instanceof PotionItem;
+    }
+
+    // res 换手吃资格: 主手食物/药水, 非煲/非盾/非弓, 不看向可交互方块, 且可换手(副手空/异物品)
+    private boolean shouldResSwapFood(InteractionHand hand, ItemStack stack) {
+        if (hand != InteractionHand.MAIN_HAND) return false;
+        if (this.resFoodSwap) return false;
+        if (stack.isEmpty() || !this.isEatOrDrink(stack)) return false;
+        UseAnim anim = stack.getUseAnimation();
+        if (anim == UseAnim.BLOCK || this.isBowLike(anim)) return false;
+        if (this.isStew(stack)) return false;
+        if (this.isLookingAtInteractableBlock()) return false;
+        // res pah()/ixihpxs: 副手持有可食/可饮物或其它占位物时不再换手, 走 vanilla(减速已由 onSlowdown 取消),
+        // 否则 吃→SWAP换回→再 UseItem→再 SWAP 会无限循环换手
+        if (!mc.player.getOffhandItem().isEmpty()) return false;
+        return this.canSwapHands();
     }
 
     // res pјіеoc 弓类判定: BOW/CROSSBOW/SPEAR

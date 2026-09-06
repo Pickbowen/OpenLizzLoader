@@ -178,7 +178,8 @@ public class NoXZMode
                 if (this.sprintBoostCounter >= 100) {
                     this.shouldJump = true;
                 }
-                boolean canAttack = this.isValidTarget(target = this.getAttackTarget()) && mc.player.isSprinting();
+                // res 对齐: 收击退包瞬间不 gate 疾跑(res VelocityModule 收包一律暂缓), 疾跑只在落地放行当闸
+                boolean canAttack = this.isValidTarget(target = this.getAttackTarget());
                 if (!mc.player.onGround()) {
                     this.enterSuspension(motionPacket);
                     receivePacketEvent.setCancelled(true);
@@ -286,9 +287,7 @@ public class NoXZMode
                     if (instantAttackEnabled) {
                         this.instantAttackProgress = 0.0f;
                     }
-                    if (mc.player.isSprinting()) {
-                        mc.player.setSprinting(false);
-                    }
+                    // res 对齐: 落地不满足时不主动 setSprinting(false), 疾跑交给移动模块, 避免与 Critical 松疾跑互相拉扯
                 }
                 return;
             }

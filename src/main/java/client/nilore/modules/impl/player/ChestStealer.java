@@ -48,6 +48,7 @@ import client.nilore.settings.impl.NumberSetting;
 import client.nilore.utils.animation.Timer;
 import client.nilore.utils.game.BlockUtil;
 import client.nilore.utils.game.ItemUtil;
+import client.nilore.utils.misc.PacketUtil;
 import client.nilore.utils.misc.ReflectionUtil;
 import client.nilore.event.EventTarget;
 
@@ -525,10 +526,23 @@ extends Module {
         if (this.pendingMenu != null && this.pendingSlot >= 0) {
             clickDelayMs = this.clickDelaySetting.getValue().longValue();
             if (clickMode.is("Packet")) {
-                int stateId = mc.player.containerMenu != null ? mc.player.containerMenu.getStateId() : 0;
-                ItemStack carriedItem = mc.player.containerMenu != null ? mc.player.containerMenu.getCarried().copy() : ItemStack.EMPTY;
+                // 对齐 res Stealer clickSlot / handleInventoryMouseClick: 先本地应用点击
+                // (同步容器槽位/光标状态), 再以 Packet 形式发出 —— 避免裸发包导致本地容器
+                // 状态失步, 使后续 Smart 判空/连点选中与实际一致。stateId 需在 clicked() 之后读
+                // (clicked 会推进本地 stateId), 与 vanilla 发包时序一致。
+                ItemStack carriedItem = this.pendingMenu.getCarried().copy();
                 Int2ObjectMap<ItemStack> changedSlots = new Int2ObjectOpenHashMap<>();
-                mc.player.connection.send(new ServerboundContainerClickPacket(this.pendingMenu.containerId, stateId, this.pendingSlot, 0, ClickType.QUICK_MOVE, carriedItem, changedSlots));
+                for (int i = 0; i < this.pendingMenu.slots.size(); ++i) {
+                    ItemStack slotStack = this.pendingMenu.slots.get(i).getItem();
+                    if (!slotStack.isEmpty()) {
+                        changedSlots.put(this.pendingMenu.slots.get(i).index, slotStack.copy());
+                    }
+                }
+                if (this.pendingSlot >= 0 && this.pendingSlot < this.pendingMenu.slots.size()) {
+                    this.pendingMenu.clicked(this.pendingSlot, 0, ClickType.QUICK_MOVE, mc.player);
+                    int stateId = this.pendingMenu.getStateId();
+                    PacketUtil.sendQueued(new ServerboundContainerClickPacket(this.pendingMenu.containerId, stateId, this.pendingSlot, 0, ClickType.QUICK_MOVE, carriedItem, changedSlots));
+                }
             } else {
                 mc.gameMode.handleInventoryMouseClick(this.pendingMenu.containerId, this.pendingSlot, 0, ClickType.QUICK_MOVE, mc.player);
             }

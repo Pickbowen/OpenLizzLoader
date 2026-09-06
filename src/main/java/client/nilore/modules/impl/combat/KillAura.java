@@ -742,7 +742,7 @@ public class KillAura extends Module {
             return this.attackEntityNewFix(entity);
         }
 
-        // KeepSprint(参考 res саѕһa): 攻击前记录疾跑状态, 疾跑攻击时保持疾跑
+        // KeepSprint(参考 res): 攻击前记录疾跑状态, 疾跑攻击时保持疾跑
         boolean keepSprinting = this.keepSprint.getValue() && mc.player.isSprinting();
 
         float currentYaw = mc.player.getYRot();
@@ -764,8 +764,8 @@ public class KillAura extends Module {
             mc.player.crit(entity);
         }
 
-        // KeepSprint: 攻击后保持疾跑(若疾跑被打断则恢复)
-        if (keepSprinting && !mc.player.isSprinting()) {
+        // KeepSprint: 攻击后保持疾跑; Critical 松疾跑窗口(hurtTime∈[2,8])内不恢复
+        if (keepSprinting && !mc.player.isSprinting() && !this.criticalReleaseWindow()) {
             mc.player.setSprinting(true);
         }
 
@@ -781,7 +781,7 @@ public class KillAura extends Module {
     private boolean attackEntityNewFix(Entity entity) {
         if (mc.getConnection() == null) return false;
 
-        // KeepSprint(参考 res саѕһa): 攻击前记录疾跑状态
+        // KeepSprint(参考 res): 攻击前记录疾跑状态
         boolean keepSprinting = this.keepSprint.getValue() && mc.player.isSprinting();
 
         float origYaw = mc.player.getYRot();
@@ -823,12 +823,18 @@ public class KillAura extends Module {
                 mc.player.onGround()
         ));
 
-        // KeepSprint: 攻击后保持疾跑(若疾跑被打断则恢复)
-        if (keepSprinting && !mc.player.isSprinting()) {
+        // KeepSprint: 攻击后保持疾跑; Critical 松疾跑窗口(hurtTime∈[2,8])内不恢复
+        if (keepSprinting && !mc.player.isSprinting() && !this.criticalReleaseWindow()) {
             mc.player.setSprinting(true);
         }
 
         return true;
+    }
+
+    // Critical 松疾跑窗口(hurtTime∈[2,8])内, 攻击后不主动恢复疾跑, 避免 KeepSprint 与 Critical 互相拉扯
+    private boolean criticalReleaseWindow() {
+        return Critical.INSTANCE != null && Critical.INSTANCE.isEnabled()
+                && Critical.INSTANCE.isReleaseWindow();
     }
 
     private float rotationJitter() {
